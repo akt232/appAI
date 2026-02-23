@@ -1,180 +1,299 @@
 import streamlit as st
 import pandas as pd
 import plotly.express as px
-import time
-import google.generativeai as genai  # <--- THƯ VIỆN AI CỦA GOOGLE
+import google.generativeai as genai
+import gspread
+import json
+import os
+import requests
+from bs4 import BeautifulSoup
+from oauth2client.service_account import ServiceAccountCredentials
+from datetime import datetime
 
-# ==========================================
-# 1. CẤU HÌNH HỆ THỐNG
-# ==========================================
-st.set_page_config(page_title="Real AI Travel CRM", page_icon="🧠", layout="wide", initial_sidebar_state="expanded")
+CONFIG_FILE = "config.json"
+DEFAULT_SHEET = ""
+LOGO_URL = "https://travel.com.vn/Content/images/logo.png"
 
-# CSS DARK MODE
+st.set_page_config(
+    page_title="Vietravel Sales Hub",
+    page_icon="🌍",
+    layout="wide"
+)
+
+def load_config():
+    if os.path.exists(CONFIG_FILE):
+        with open(CONFIG_FILE, "r") as f:
+            return json.load(f)
+    return {"sheet_url": DEFAULT_SHEET, "tour_sheet_url": ""}
+
+def save_config(data):
+    with open(CONFIG_FILE, "w") as f:
+        json.dump(data, f, indent=4)
+
+config = load_config()
+
+if "api_key" not in st.session_state:
+    st.session_state.api_key = ""
+if "sheet_url" not in st.session_state:
+    st.session_state.sheet_url = config.get("sheet_url", DEFAULT_SHEET)
+if "tour_sheet_url" not in st.session_state:
+    st.session_state.tour_sheet_url = config.get("tour_sheet_url", "")
+if "selected_customer" not in st.session_state:
+    st.session_state.selected_customer = None
+if "chat_history" not in st.session_state:
+    st.session_state.chat_history = []
+if "customer_list" not in st.session_state:
+    st.session_state.customer_list = [
+        {"id": 1, "name": "Anh Hùng", "msg": "Anh muốn đi Nhật tháng 3 ngân sách 40000000", "time": "10:30"},
+        {"id": 2, "name": "Chị Lan", "msg": "Tour Thái Lan bao nhiêu tiền em?", "time": "09:15"},
+        {"id": 3, "name": "Khách Web", "msg": "Tư vấn giúp tour Đà Nẵng", "time": "08:00"},
+    ]
+
 st.markdown("""
 <style>
-    .stApp { background-color: #0f172a; color: #e2e8f0; }
-    section[data-testid="stSidebar"] { background-color: #1e293b; border-right: 1px solid #334155; }
-    .css-card { background-color: #1e293b; border: 1px solid #334155; border-radius: 12px; padding: 20px; margin-bottom: 20px; }
-    h1, h2, h3 { color: #38bdf8 !important; }
-    .msg-user { background-color: #334155; color: white; padding: 10px; border-radius: 10px 10px 5px 10px; margin: 5px 0; float: right; clear: both; max-width: 80%; }
-    .msg-ai { background-color: #0284c7; color: white; padding: 10px; border-radius: 10px 10px 10px 5px; margin: 5px 0; float: left; clear: both; max-width: 80%; }
-    header {visibility: hidden;}
+.stApp {background:#0f172a;color:#e2e8f0;}
+.card {background:#020617;padding:20px;border-radius:10px;border:1px solid #1e293b;margin-bottom:20px;}
+.stButton>button {background:#1d4ed8;color:white;border-radius:6px;border:none;height:40px;}
+.chat-box {background:#020617;border:1px solid #1e293b;border-radius:10px;height:60vh;display:flex;flex-direction:column;}
+.chat-area {flex-grow:1;overflow-y:auto;padding:15px;}
+.msg {background:#334155;padding:10px;border-radius:8px;margin-bottom:10px;}
 </style>
 """, unsafe_allow_html=True)
 
-# ==========================================
-# 2. KẾT NỐI AI (THE BRAIN)
-# ==========================================
-
-# Sidebar nhập API Key (Để bảo mật)
-with st.sidebar:
-    st.title("🧠 CẤU HÌNH AI")
-    api_key = st.text_input("Nhập Google Gemini API Key:", type="password")
-    st.caption("Chưa có Key? Truy cập [aistudio.google.com](https://aistudio.google.com/app/apikey) để lấy miễn phí.")
-    
-    if api_key:
-        genai.configure(api_key=api_key)
-        st.success("Đã kết nối não bộ AI! 🟢")
-    else:
-        st.warning("Vui lòng nhập Key để AI hoạt động.")
-
-# HÀM 1: AI TƯ VẤN KHÁCH HÀNG (ZALO CHAT)
-def ask_gemini_chat(user_msg):
-    if not api_key: return "⚠️ Vui lòng nhập API Key để tôi trả lời."
-    
-    # Kịch bản huấn luyện AI (System Prompt)
-    prompt = f"""
-    Bạn là một nhân viên Sale Tour du lịch xuất sắc, thân thiện và chốt sale giỏi của công ty 'Travel AI'.
-    Sản phẩm chủ lực: Tour Thái Lan 5N4Đ, Bay Vietnam Airlines, Khách sạn 4 sao, Giá 7.990k.
-    
-    Khách hàng hỏi: "{user_msg}"
-    
-    Hãy trả lời ngắn gọn (dưới 3 câu), khéo léo, tập trung vào lợi ích (VD: Bay giờ đẹp, 23kg hành lý) và kêu gọi hành động.
-    """
+def ask_gemini(prompt):
+    if not st.session_state.api_key:
+        return "Chưa nhập API Key"
     try:
-        model = genai.GenerativeModel('gemini-pro')
-        response = model.generate_content(prompt)
-        return response.text
+        genai.configure(api_key=st.session_state.api_key)
+        model = genai.GenerativeModel('gemini-1.5-flash')
+        return model.generate_content(prompt).text
     except Exception as e:
-        return f"Lỗi AI: {e}"
+        return str(e)
 
-# HÀM 2: AI BÓC TÁCH DỮ LIỆU (ZERO-TOUCH)
-def ask_gemini_extract(raw_text):
-    if not api_key: return "Chưa có Key", "Chưa có Key", "Chưa có Key", "Chưa có Key"
-    
+def extract_data(text):
     prompt = f"""
-    Hãy trích xuất thông tin từ đoạn văn sau và trả về định dạng: Tên | Nhu cầu Tour | Ngân sách | Ghi chú.
-    Nếu không có thông tin thì ghi "Không rõ".
-    Đoạn văn: "{raw_text}"
-    
-    Chỉ trả về 1 dòng duy nhất ngăn cách bởi dấu |. Ví dụ: Anh Nam | Tour Nhật | 20 triệu | Ăn chay
+    Trích xuất thông tin khách hàng từ nội dung:
+    {text}
+    Trả JSON:
+    {{
+    "name":"",
+    "tour":"",
+    "budget":"",
+    "note":""
+    }}
     """
+    res = ask_gemini(prompt)
     try:
-        model = genai.GenerativeModel('gemini-pro')
-        response = model.generate_content(prompt)
-        # Xử lý kết quả trả về
-        parts = response.text.split('|')
-        if len(parts) >= 4:
-            return parts[0].strip(), parts[1].strip(), parts[2].strip(), parts[3].strip()
-        else:
-            return parts[0], "Lỗi định dạng", "", ""
+        start = res.find('{')
+        end = res.rfind('}') + 1
+        return json.loads(res[start:end])
     except:
-        return "Lỗi", "Lỗi", "Lỗi", "Lỗi"
+        return None
 
-# ==========================================
-# 3. GIAO DIỆN & LOGIC
-# ==========================================
+def connect_sheet(url):
+    scope = [
+        "https://spreadsheets.google.com/feeds",
+        "https://www.googleapis.com/auth/drive"
+    ]
+    creds = ServiceAccountCredentials.from_json_keyfile_name("credentials.json", scope)
+    client = gspread.authorize(creds)
+    sheet = client.open_by_url(url).sheet1
+    return sheet
 
-# Dữ liệu mẫu & Session
-if "chat_history" not in st.session_state:
-    st.session_state.chat_history = []
-if "extracted_data" not in st.session_state:
-    st.session_state.extracted_data = {"name": "", "tour": "", "budget": "", "note": ""}
+def save_to_sheet(data_row):
+    try:
+        sheet = connect_sheet(st.session_state.sheet_url)
+        sheet.append_row(data_row)
+        return True
+    except Exception as e:
+        st.error(e)
+        return False
 
-# Dữ liệu biểu đồ (Fake data để vẽ)
-df_kenh = pd.DataFrame({'Kênh': ['Facebook', 'Zalo', 'Tổng đài', 'Website'], 'Doanh thu': [3.5, 2.1, 1.8, 4.2]})
+def load_sheet():
+    try:
+        sheet = connect_sheet(st.session_state.sheet_url)
+        data = sheet.get_all_records()
+        return pd.DataFrame(data)
+    except:
+        return pd.DataFrame()
 
-# --- MENU CHÍNH ---
-with st.sidebar:
-    st.markdown("---")
-    menu = st.radio("CHỨC NĂNG", ["🎙️ Nhập liệu AI (Thật)", "💬 Zalo Chat AI (Thật)", "📊 Dashboard"])
+def delete_row(row_number):
+    try:
+        sheet = connect_sheet(st.session_state.sheet_url)
+        sheet.delete_rows(row_number)
+        return True
+    except Exception as e:
+        st.error(e)
+        return False
 
-# --- TRANG 1: NHẬP LIỆU AI ---
-if menu == "🎙️ Nhập liệu AI (Thật)":
-    st.title("🎙️ AI Auto-Extraction (Bóc tách thật)")
-    st.caption("AI sẽ đọc hiểu đoạn văn bất kỳ và điền vào form.")
+def load_tour_sheet():
+    if not st.session_state.tour_sheet_url:
+        return pd.DataFrame()
+    try:
+        sheet = connect_sheet(st.session_state.tour_sheet_url)
+        data = sheet.get_all_records()
+        return pd.DataFrame(data)
+    except:
+        return pd.DataFrame()
+
+def suggest_tour_logic(customer_text):
+    df_tours = load_tour_sheet()
+    if df_tours.empty:
+        return pd.DataFrame()
     
+    customer_text_lower = customer_text.lower()
+    
+    # Danh sách các từ khóa cần bỏ qua (stop words) để tránh bắt nhầm
+    ignored_words = ["anh", "chị", "em", "muốn", "đi", "tư", "vấn", "giúp", "tour", "bao", "nhiêu", "tiền", "tháng"]
+    
+    # Tách các từ trong câu chat của khách và lọc bỏ từ vô nghĩa
+    words = [w for w in customer_text_lower.split() if w not in ignored_words and len(w) > 1]
+    
+    matches = []
+    for _, row in df_tours.iterrows():
+        # Lấy dữ liệu từ cột "Tour (Tên tour)" và "Mô tả" (theo file của bạn)
+        tour_name = str(row.get('Tour (Tên tour)', '')).lower()
+        description = str(row.get('Mô tả', '')).lower()
+        
+        # Chỉ giữ lại tour nếu có ít nhất một từ khóa quan trọng xuất hiện
+        is_match = any(word in tour_name for word in words) or \
+                   any(word in description for word in words)
+        
+        if is_match:
+            matches.append(row)
+            
+    # Trả về DataFrame chứa các dòng khớp, nếu không có thì trả về DF trống
+    return pd.DataFrame(matches) if matches else pd.DataFrame()
+
+def render_dashboard():
+    st.title("📊 Dashboard")
+    df = load_sheet()
+    if df.empty:
+        st.warning("Chưa có dữ liệu")
+        return
+
+    df["Giá"] = pd.to_numeric(df["Giá"], errors="coerce").fillna(0)
+    df["Ngày"] = pd.to_datetime(df["Ngày"], errors="coerce")
+
+    today = datetime.now().date()
+    today_df = df[df["Ngày"].dt.date == today]
+
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Khách hôm nay", len(today_df))
+    col2.metric("Doanh thu hôm nay", f"{today_df['Giá'].sum():,.0f} đ")
+    col3.metric("Tổng khách", len(df))
+    col4.metric("Tổng doanh thu", f"{df['Giá'].sum():,.0f} đ")
+
+    route_df = df.groupby("Tour").agg({"Tên": "count", "Giá": "sum"}).reset_index()
+    route_df.columns = ["Tuyến", "Khách", "Doanh thu"]
+
     col1, col2 = st.columns(2)
     with col1:
-        st.markdown('<div class="css-card">', unsafe_allow_html=True)
-        st.subheader("1. Dữ liệu đầu vào")
-        input_text = st.text_area("Nhập nội dung cuộc gọi/tin nhắn:", 
-                                  value="Chị Lan cần tìm tour đi Hàn Quốc ngắm lá đỏ tháng 10 này. Nhà chị có 2 vợ chồng với 1 bé nhỏ 5 tuổi. Kinh phí tầm 15 triệu một người thôi em nhé.", height=150)
-        
-        if st.button("🚀 Yêu cầu AI Bóc tách"):
-            with st.spinner("AI đang đọc hiểu..."):
-                # GỌI HÀM AI THẬT
-                n, t, b, no = ask_gemini_extract(input_text)
-                st.session_state.extracted_data = {"name": n, "tour": t, "budget": b, "note": no}
-            st.success("Đã xong!")
-        st.markdown('</div>', unsafe_allow_html=True)
-        
+        fig = px.bar(route_df, x="Khách", y="Tuyến", orientation="h")
+        st.plotly_chart(fig, use_container_width=True)
     with col2:
-        st.markdown('<div class="css-card">', unsafe_allow_html=True)
-        st.subheader("2. Kết quả (Form tự động)")
-        with st.form("result_form"):
-            c_a, c_b = st.columns(2)
-            st.text_input("Họ tên", value=st.session_state.extracted_data['name'])
-            st.text_input("Nhu cầu", value=st.session_state.extracted_data['tour'])
-            st.text_input("Ngân sách", value=st.session_state.extracted_data['budget'])
-            st.text_area("Ghi chú", value=st.session_state.extracted_data['note'])
-            st.form_submit_button("Lưu")
-        st.markdown('</div>', unsafe_allow_html=True)
+        fig = px.bar(route_df, x="Doanh thu", y="Tuyến", orientation="h")
+        st.plotly_chart(fig, use_container_width=True)
 
-# --- TRANG 2: ZALO CHAT AI ---
-elif menu == "💬 Zalo Chat AI (Thật)":
-    st.title("💬 Zalo Chat với AI (Thông minh)")
-    
-    col_chat, col_tools = st.columns([2, 1])
-    
-    with col_tools:
-        st.markdown('<div class="css-card">', unsafe_allow_html=True)
-        st.subheader("🛠️ Công cụ Test")
-        st.info("Nhập câu hỏi bất kỳ, AI sẽ tự nghĩ câu trả lời chứ không theo mẫu.")
-        test_msg = st.text_input("Giả lập khách hỏi:", "Tour này có đi đảo Coral không em?")
-        if st.button("Gửi tin nhắn giả lập"):
-            st.session_state.chat_history.append({"role": "user", "content": test_msg})
-            # GỌI AI TRẢ LỜI
-            ai_reply = ask_gemini_chat(test_msg)
-            st.session_state.chat_history.append({"role": "ai", "content": ai_reply})
-            st.rerun()
-        st.markdown('</div>', unsafe_allow_html=True)
+def render_sales_center():
+    col_left, col_mid, col_right = st.columns([1, 2, 1])
 
-    with col_chat:
-        st.markdown('<div class="css-card">', unsafe_allow_html=True)
-        chat_container = st.container(height=400)
-        with chat_container:
-            if not api_key:
-                st.warning("⚠️ Hãy nhập API Key ở menu bên trái để Chatbot hoạt động!")
+    with col_left:
+        st.subheader("Khách hàng")
+        for cust in st.session_state.customer_list:
+            if st.button(f"{cust['name']} - {cust['time']}", key=cust["id"]):
+                st.session_state.selected_customer = cust
+
+    with col_mid:
+        cust = st.session_state.selected_customer
+        if cust:
+            st.subheader(f"Chat với {cust['name']}")
+            st.markdown(f"""
+            <div class="chat-box">
+                <div class="chat-area">
+                    <div class="msg">{cust['msg']}</div>
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+
+            st.divider()
+            st.subheader("🎯 Tour gợi ý (Dựa trên dữ liệu Sheet)")
+            suggested_df = suggest_tour_logic(cust["msg"])
             
-            for msg in st.session_state.chat_history:
-                role_class = "msg-user" if msg['role'] == "user" else "msg-ai"
-                prefix = "👤 Khách:" if msg['role'] == "user" else "🤖 AI:"
-                st.markdown(f'<div class="{role_class}"><b>{prefix}</b><br>{msg["content"]}</div>', unsafe_allow_html=True)
-        
-        # Ô nhập liệu thật
-        if prompt := st.chat_input("Nhập tin nhắn trả lời khách..."):
-            st.session_state.chat_history.append({"role": "user", "content": prompt})
-            # Gọi AI trả lời
-            response = ask_gemini_chat(prompt)
-            st.session_state.chat_history.append({"role": "ai", "content": response})
-            st.rerun()
-        st.markdown('</div>', unsafe_allow_html=True)
+            if suggested_df is not None and not suggested_df.empty:
+                st.dataframe(suggested_df, use_container_width=True)
+            else:
+                st.info("Không tìm thấy tour khớp trực tiếp trong Sheet dữ liệu.")
 
-# --- TRANG 3: DASHBOARD ---
-elif menu == "📊 Dashboard":
-    st.title("📊 Báo cáo Doanh thu")
-    st.markdown('<div class="css-card">', unsafe_allow_html=True)
-    fig = px.bar(df_kenh, x='Doanh thu', y='Kênh', orientation='h', title="Doanh thu theo Kênh")
-    st.plotly_chart(fig, use_container_width=True)
-    st.markdown('</div>', unsafe_allow_html=True)
+            status = st.selectbox("Trạng thái", ["Đang theo dõi", "Đã chốt đơn", "Không chốt"])
+
+            if status == "Đã chốt đơn":
+                data = extract_data(cust["msg"])
+                name = data.get("name", cust["name"]) if data else cust["name"]
+                tour = data.get("tour", "") if data else ""
+                budget = data.get("budget", "") if data else ""
+                note = data.get("note", "") if data else ""
+
+                with st.form("deal"):
+                    name = st.text_input("Tên", name)
+                    tour = st.text_input("Tour", tour)
+                    budget = st.text_input("Giá", budget)
+                    note = st.text_area("Note", note)
+                    sale = st.text_input("Sale")
+                    channel = st.selectbox("Kênh", ["Online", "Facebook", "Zalo", "Chi nhánh"])
+                    if st.form_submit_button("Xác nhận"):
+                        saved = save_to_sheet([datetime.now().strftime("%Y-%m-%d"), name, tour, budget, note, channel, sale])
+                        if saved: st.success("Đã lưu Sheet")
+
+    with col_right:
+        st.subheader("AI Tư Vấn")
+        user_q = st.text_input("Hỏi AI")
+        if st.button("Gửi"):
+            res = ask_gemini(f"Bạn là chuyên gia tư vấn tour Vietravel. Trả lời: {user_q}")
+            st.session_state.chat_history.append(("Bạn", user_q))
+            st.session_state.chat_history.append(("AI", res))
+        for role, msg in st.session_state.chat_history:
+            st.write(f"**{role}:** {msg}")
+
+def render_customer_orders():
+    st.title("Customers & Orders")
+    st.dataframe(pd.DataFrame(st.session_state.customer_list))
+    st.divider()
+    df = load_sheet()
+    if df.empty:
+        st.info("Chưa có dữ liệu")
+        return
+    for idx, row in df.iterrows():
+        c1, c2, c3, c4, c5, c6 = st.columns([2,2,2,2,2,1])
+        c1.write(row.get('Ngày',''))
+        c2.write(row.get('Tên',''))
+        c3.write(row.get('Tour',''))
+        c4.write(row.get('Giá',''))
+        c5.write(row.get('Kênh',''))
+        if c6.button("❌", key=f"del_{idx}"):
+            if delete_row(idx + 2): st.rerun()
+
+def render_settings():
+    st.title("Settings")
+    key = st.text_input("Gemini API Key", value=st.session_state.api_key, type="password")
+    if st.button("Save API"):
+        st.session_state.api_key = key
+        st.success("Saved")
+    st.divider()
+    sheet_link = st.text_input("Link Sheet Đơn", value=st.session_state.sheet_url)
+    if st.button("Lưu Link Đơn"):
+        st.session_state.sheet_url = sheet_link
+        save_config({"sheet_url": sheet_link, "tour_sheet_url": st.session_state.tour_sheet_url})
+    st.divider()
+    tour_link = st.text_input("Link Sheet Tour Data", value=st.session_state.tour_sheet_url)
+    if st.button("Lưu Link Tour"):
+        st.session_state.tour_sheet_url = tour_link
+        save_config({"sheet_url": st.session_state.sheet_url, "tour_sheet_url": tour_link})
+
+st.sidebar.image(LOGO_URL, width=150)
+menu = st.sidebar.radio("MENU", ["Dashboard", "Sales Center", "Customers & Orders", "Settings"])
+
+if menu == "Dashboard": render_dashboard()
+elif menu == "Sales Center": render_sales_center()
+elif menu == "Customers & Orders": render_customer_orders()
+elif menu == "Settings": render_settings()
